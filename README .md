@@ -85,7 +85,6 @@ Separating scoring from explanation keeps the score reliable and reproducible wh
 
 When an answer is wrong, a second call generates a **re-explanation of the underlying concept using a different framing**, such as an analogy or a simpler model, rather than restating a textbook definition. The prompt restricts the model to the uploaded study material to reduce the risk of introducing facts that aren't in the notes. The learner sees the standard feedback and the alternative explanation side by side.
 
-![Alternative explanation after an incorrect answer](assets/reteach.png)
 
 ### 6. Quiz session as a state machine
 
