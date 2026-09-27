@@ -2,9 +2,7 @@
 
 An LLM-powered study tool built with Streamlit and the Claude API. It ingests lecture notes (PDF, DOCX or TXT), produces structured revision summaries, generates topic-tagged multiple-choice quizzes, and re-explains a concept in a different way whenever a question is answered incorrectly. Summaries and quizzes can be exported to Word or PDF. A second tool, **CV review**, reuses the same ingestion and export pipeline to give evidence-based feedback on a CV, optionally against a specific job description. A SQLite persistence layer implementing the **SM-2 spaced-repetition algorithm** is included for scheduling reviews across sessions.
 
-**[Live demo](https://study-buddy.streamlit.app)** <!-- update or remove -->
 
-![Quiz generated from uploaded lecture notes](assets/quiz.png)
 
 ---
 
