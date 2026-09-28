@@ -1,6 +1,6 @@
 # Study-Buddy
 
-An LLM-powered study tool built with Streamlit and the Claude API. It ingests lecture notes (PDF, DOCX or TXT), produces structured revision summaries, generates topic-tagged multiple-choice quizzes, and re-explains a concept in a different way whenever a question is answered incorrectly. Summaries and quizzes can be exported to Word or PDF. A second tool, **CV review**, reuses the same ingestion and export pipeline to give evidence-based feedback on a CV, optionally against a specific job description. A SQLite persistence layer implementing the **SM-2 spaced-repetition algorithm** is included for scheduling reviews across sessions.
+An LLM-powered study tool built with Streamlit and the Claude API. It ingests lecture notes (PDF, DOCX or TXT), produces structured revision summaries, generates topic-tagged multiple-choice quizzes, and re-explains a concept in a different way whenever a question is answered incorrectly. Summaries and quizzes can be exported to Word or PDF. A second tool, **CV review**, reuses the same ingestion and export pipeline to give evidence-based feedback on a CV, optionally against a specific job description. Users sign in with their own **accounts**, and every question they answer is saved to a SQLite database and scheduled for review with the **SM-2 spaced-repetition algorithm**, so weak material comes back in later sessions.
 
 
 
@@ -10,6 +10,7 @@ An LLM-powered study tool built with Streamlit and the Claude API. It ingests le
 
 ```mermaid
 flowchart TD
+    Z[Log in / create account] --> A
     A[Upload PDF / DOCX / TXT<br/>or paste text] --> B[Text extraction]
     B --> C[Summary generation]
     B --> D[Question generation loop<br/>one JSON question per call]
@@ -21,6 +22,10 @@ flowchart TD
     H --> J[Next question]
     I --> J
     J --> K[Session summary<br/>score and per-question results]
+    D -->|save cards| DB[(SQLite: users, topics,<br/>cards, review_log)]
+    G -->|SM-2 update per answer| DB
+    DB -->|due cards| G
+    DB --> P[Progress: mastery per topic,<br/>recent answers]
     B --> L[CV review<br/>optional job description]
     L --> M[Scored feedback: strengths,<br/>weaknesses, rewrites, role fit]
     M --> N[Export feedback<br/>DOCX / PDF]
@@ -31,9 +36,10 @@ The two tools share one app and are selected from the sidebar: **Study** (summar
 | File | Role |
 |---|---|
 | `app.py` | Streamlit app: ingestion, LLM calls, quiz state machine, CV review, exports |
-| `db.py` | SQLite persistence layer with SM-2 spaced-repetition scheduling |
+| `db.py` | SQLite persistence: user accounts, password hashing, per-user data, SM-2 scheduling, schema migrations |
 | `prompts.py` | Refined prompt templates, including topic-label consistency and quality scoring |
-| `test_db.py` | End-to-end check of the database layer (create topic → add card → review → mastery report) |
+| `test_db.py` | Database tests: accounts, password storage, data isolation between users, SM-2 intervals, migration |
+| `test_app.py` | End-to-end tests that drive the Streamlit app (sign up, quiz, review due cards) with the Claude API faked |
 | `01_generate_questions.py`, `02_quiz_with_grading.py` | Early command-line prototypes (see [Prompt design history](#prompt-design-history)) |
 
 ---
@@ -106,15 +112,38 @@ All exports are built in memory (`io.BytesIO`) and served through Streamlit down
 
 The export builders take a document title as a parameter, so the same Markdown-to-DOCX/PDF code serves study summaries, quizzes and CV feedback.
 
-### 8. Spaced-repetition layer (SM-2)
+### 8. User accounts
 
-`db.py` implements a persistence layer for long-term review scheduling, using SQLite with three tables:
+The app opens on a log-in / create-account page, and nothing else runs until a user is signed in. The signed-in user is kept in `st.session_state`, and the sidebar shows who is signed in, a **Log out** button and a **Delete my account** option.
+
+- **Passwords are never stored.** Each password is hashed with **PBKDF2-HMAC-SHA256** (600,000 iterations, the OWASP recommendation) and a random 16-byte salt, so identical passwords produce different hashes and a stolen database can't be reversed cheaply. The stored value records the algorithm and iteration count (`pbkdf2_sha256$600000$<salt>$<hash>`), so the cost can be raised later without breaking existing accounts.
+- **Constant-time checks.** Hashes are compared with `hmac.compare_digest`, and a log-in with an unknown username still performs a full hash, so response times don't reveal which usernames exist. Both failures show the same message.
+- **Case-insensitive usernames.** `COLLATE NOCASE` makes "Sara" and "sara" the same account at the database level.
+- **Parameterised SQL everywhere.** User input is always passed as `?` parameters, never formatted into query strings, so it can't inject SQL (there is a test for this).
+
+### 9. Per-user data and spaced repetition (SM-2)
+
+All study data is stored in SQLite and belongs to a user:
+
+```
+users ─< topics ─< cards ─< review_log
+```
 
 | Table | Stores |
 |---|---|
-| `topics` | Topic name (unique) and source notes |
+| `users` | Username (unique, case-insensitive), password hash, creation time |
+| `topics` | Owner, topic name (unique **per user**) and source notes |
 | `cards` | Question, options (JSON), correct answer, and SM-2 state: repetitions, ease factor, interval, next review date |
 | `review_log` | Every review with correctness and a 0-5 quality score |
+
+Foreign keys are enforced (`PRAGMA foreign_keys = ON`, which SQLite leaves off by default) with `ON DELETE CASCADE`, so deleting an account removes all of that user's topics, cards and reviews. Every query that reads or changes study data filters by the signed-in user; updating a card first looks it up **through its topic's owner**, so a card id belonging to someone else is rejected rather than modified.
+
+How it plugs into the app:
+
+- **Generate quiz** saves each question as a card on the user's account.
+- **Submit answer** grades the answer in code (as before) and then calls `update_card_after_review`, which updates the card's SM-2 state and logs the review in one transaction.
+- **Review due cards (N)** loads the user's cards whose review date has arrived, including ones from earlier sessions, and runs them through the same quiz flow. Each card keeps its original notes, so feedback and re-explanations stay grounded in the right material.
+- **Your progress** shows a per-topic mastery table and the user's recent answers.
 
 After each review, `update_card_after_review` applies the SM-2 algorithm:
 
@@ -122,11 +151,13 @@ After each review, `update_card_after_review` applies the SM-2 algorithm:
 - **Quality ≥ 3 (correct):** intervals grow from 1 day, to 6 days, then to `previous interval × ease factor`.
 - **Ease factor update:** `EF' = EF + (0.1 − (5 − q)(0.08 + (5 − q)·0.02))`, floored at 1.3, so cards that are consistently hard come back more often.
 
-Supporting queries return cards that are due for review (oldest first), a per-topic mastery report (a card counts as mastered after 3 consecutive successful repetitions), and recent review history.
+Supporting queries return a user's cards that are due for review (oldest first), a per-topic mastery report (a card counts as mastered after 3 consecutive successful repetitions), and recent review history.
 
-**Status:** the scheduling layer is implemented and exercised by `test_db.py`; connecting it to the Streamlit quiz flow is the next step on the roadmap.
+### 10. Schema migrations
 
-### 9. CV review
+The schema version is stored in SQLite's built-in `PRAGMA user_version`. On start-up, `init_db()` creates a fresh database or upgrades an older one in place. Upgrading the original single-user schema (version 0) to accounts (version 2) needs table rebuilds, because SQLite can't add a foreign key or change a `UNIQUE` constraint on an existing table: each table is recreated, rows are copied across, and the old table is dropped, all inside one transaction, followed by a `PRAGMA foreign_key_check`. Existing topics are given to the **first account created**, so an existing install keeps its history. The migration was checked against a real database (2 topics, 16 cards, 19 reviews preserved).
+
+### 11. CV review
 
 A separate page applies the same pipeline to career feedback. The user uploads a CV (PDF, DOCX or TXT, handled by the same extractors as study notes) and can optionally paste a job description.
 
@@ -149,7 +180,7 @@ The prompt is designed to keep feedback grounded and honest:
 
 Results are rendered as strengths and weaknesses side by side, before/after bullet comparisons and a coverage-vs-gaps view for the role, and can be downloaded as Word or PDF by converting the JSON to Markdown and passing it through the shared export builders. Malformed JSON is caught separately from other errors so the user gets a clear prompt to retry. The CV is processed in memory and not stored by the app.
 
-### 10. API key handling
+### 12. API key handling
 
 `get_api_key()` checks Streamlit secrets first (for Streamlit Community Cloud) and falls back to an environment variable loaded from `.env` via `python-dotenv` (for local development), so the same code runs in both environments without credentials in the repository.
 
@@ -192,19 +223,24 @@ Both files are git-ignored. Then run:
 python -m streamlit run app.py
 ```
 
-Use the sidebar to switch between **Study** and **CV review**.
+Create an account on the first screen; the database file (`study_buddy.db`) is created automatically and is git-ignored.
 
-To exercise the spaced-repetition layer on its own:
+### Tests
 
 ```bash
-python test_db.py
+pip install -r requirements-dev.txt
+pytest -q
 ```
+
+26 tests: `test_db.py` covers accounts, password storage, data isolation, SM-2 and migration; `test_app.py` drives the real Streamlit app with `streamlit.testing.v1.AppTest` (sign up, generate a quiz, answer, review due cards, log out). The Claude API is replaced by a fake in the tests, so they need no API key and cost nothing.
 
 ---
 
 ## Limitations and future work
 
-- **Connect SM-2 to the UI.** Save generated questions as cards, feed each answer's quality score into `update_card_after_review`, and add a "due for review" mode so weak topics resurface in later sessions.
+- **Hosting a database.** SQLite is a file on the server. On Streamlit Community Cloud that file is not persistent, so accounts and progress are lost whenever the app restarts or redeploys. A public deployment should use a hosted database such as PostgreSQL; the SQL in `db.py` is standard enough to port.
+- **Account features.** There is no password reset, email verification, "remember me" across browser sessions, or limit on repeated failed log-ins. A production version would add rate limiting and use an established auth provider rather than hand-rolled accounts.
+- **Answer quality is binary.** SM-2 receives quality 5 for a correct answer and 1 for a wrong one. Asking users how hard a correct answer felt (the original SM-2 design) would schedule reviews more precisely.
 - **Re-test after re-teaching.** Automatically queue a new question on the same topic after an alternative explanation, to check the concept has actually landed.
 - **Topic-label drift.** Labels generated independently per question can vary for the same concept (e.g. "Soundness and Completeness" vs "Soundness vs Completeness"). `prompts.py` adds an instruction to reuse existing labels; passing the list of existing topics into the prompt or normalising labels would fix this more robustly.
 - **Guaranteed structured output.** Using tool use / structured outputs instead of prompt-only JSON instructions would remove the need for fence-stripping and parsing fallbacks.
