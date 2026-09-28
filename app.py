@@ -10,6 +10,8 @@ from docx.shared import RGBColor
 import io
 from fpdf import FPDF
 
+import db
+
 load_dotenv()
 
 def get_api_key():
@@ -237,6 +239,71 @@ st.set_page_config(page_title="Study Buddy", page_icon="book", layout="centered"
 st.title("Study Buddy")
 st.caption("Upload notes, get a summary, get quizzed, and download everything for later.")
 
+
+@st.cache_resource
+def init_database():
+    """Create or upgrade the database once per server process, not on every rerun."""
+    db.init_db()
+    return True
+
+
+init_database()
+
+
+def show_login():
+    st.write("Log in or create an account. Your questions and progress are saved to your account, "
+             "and questions you've answered come back when they're due for review.")
+    login_tab, signup_tab = st.tabs(["Log in", "Create account"])
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log in", use_container_width=True)
+        if submitted:
+            user = db.authenticate(username, password)
+            if user:
+                st.session_state.user = user
+                st.rerun()
+            else:
+                st.error("Wrong username or password.")
+    with signup_tab:
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose a username", key="signup_username")
+            new_password = st.text_input("Choose a password (at least 8 characters)", type="password",
+                                         key="signup_password")
+            confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
+            created = st.form_submit_button("Create account", use_container_width=True)
+        if created:
+            if new_password != confirm:
+                st.error("The passwords don't match.")
+            else:
+                try:
+                    user_id = db.create_user(new_username, new_password)
+                    st.session_state.user = {"id": user_id, "username": new_username.strip()}
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+
+if "user" not in st.session_state:
+    show_login()
+    st.stop()
+
+user = st.session_state.user
+
+with st.sidebar:
+    st.write(f"Signed in as **{user['username']}**")
+    if st.button("Log out", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+    with st.expander("Delete my account"):
+        st.write("This permanently deletes your account and all of your saved questions and progress.")
+        confirm_delete = st.checkbox("I understand this can't be undone", key="confirm_delete")
+        if st.button("Delete account", disabled=not confirm_delete, use_container_width=True):
+            db.delete_user(user["id"])
+            st.session_state.clear()
+            st.rerun()
+
 defaults = {
     "notes": "", "current_card": None, "mode": "setup",
     "feedback_text": "", "reexplanation": "", "student_choice": None,
@@ -323,6 +390,9 @@ with col1:
                     asked.append(q["question"])
                     cards.append(q)
                 progress_placeholder.empty()
+                for c in cards:
+                    c["card_id"] = db.save_generated_card(user["id"], c, notes_to_use)
+                    c["notes"] = notes_to_use
                 st.session_state.generated_cards = cards
                 st.session_state.session_queue = cards
                 st.session_state.session_index = 0
@@ -354,6 +424,17 @@ with col2:
     else:
         st.button("Download quiz as Word", disabled=True, use_container_width=True)
 
+due_count = db.count_due_cards(user["id"])
+if st.button(f"Review due cards ({due_count})", disabled=due_count == 0, use_container_width=True,
+             help="Questions you've answered before come back when spaced repetition says they're due."):
+    due = db.get_due_cards(user["id"])
+    st.session_state.session_queue = due
+    st.session_state.session_index = 0
+    st.session_state.session_results = []
+    st.session_state.current_card = due[0]
+    st.session_state.mode = "quiz"
+    st.rerun()
+
 if st.button("Reset everything", use_container_width=True):
     for key in defaults:
         del st.session_state[key]
@@ -384,16 +465,19 @@ if st.session_state.mode == "quiz" and st.session_state.current_card:
             st.session_state.session_results.append({
                 "question": card["question"], "topic": card["topic"], "correct": is_correct
             })
+            card_notes = card.get("notes") or st.session_state.notes
             try:
                 with st.spinner("Checking your answer..."):
                     feedback, quality = get_feedback_and_quality(
-                        st.session_state.notes, card["question"], card["options"],
+                        card_notes, card["question"], card["options"],
                         card["correct_answer"], choice
                     )
                     st.session_state.feedback_text = feedback
+                    if card.get("card_id"):
+                        db.update_card_after_review(user["id"], card["card_id"], quality)
                     if not is_correct:
                         st.session_state.reexplanation = reexplain(
-                            st.session_state.notes, card["question"], card["correct_answer"], choice
+                            card_notes, card["question"], card["correct_answer"], choice
                         )
                         st.session_state.mode = "reteach"
                     else:
@@ -443,6 +527,25 @@ if st.session_state.mode == "summary":
     if st.button("Back to study material", use_container_width=True):
         st.session_state.mode = "setup"
         st.rerun()
+
+st.divider()
+st.subheader("Your progress")
+mastery = db.get_topic_mastery(user["id"])
+if not mastery:
+    st.caption("Generate a quiz and answer some questions: your topics and progress will appear here.")
+else:
+    st.dataframe(
+        [{"Topic": m["name"], "Questions": m["total_cards"], "Mastered": m["mastered_count"] or 0,
+          "Average ease": round(m["avg_ease"] or 0, 2)} for m in mastery],
+        hide_index=True, use_container_width=True
+    )
+    st.caption("A question counts as mastered after 3 correct reviews in a row.")
+    history = db.get_review_history(user["id"], limit=20)
+    if history:
+        with st.expander("Recent answers"):
+            for h in history:
+                mark = "CORRECT" if h["was_correct"] else "WRONG"
+                st.write(f"[{mark}] ({h['topic_name']}) {h['question']}")
 
 st.divider()
 st.caption("Built by Sara Ghassemi - Powered by Claude Anthropic")
