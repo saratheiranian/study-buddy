@@ -185,10 +185,10 @@ def build_summary_pdf(summary_text):
         clean_line = line.encode("latin-1", "ignore").decode("latin-1")
         if clean_line.startswith("#"):
             pdf.set_font("Helvetica", "B", 13)
-            pdf.multi_cell(0, 8, clean_line.lstrip("# "))
+            pdf.multi_cell(0, 8, clean_line.lstrip("# "), new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", "", 11)
         else:
-            pdf.multi_cell(0, 7, clean_line)
+            pdf.multi_cell(0, 7, clean_line, new_x="LMARGIN", new_y="NEXT")
     return bytes(pdf.output())
 
 def build_quiz_docx(cards):
@@ -221,14 +221,14 @@ def build_quiz_pdf(cards):
         pdf.set_font("Helvetica", "B", 12)
         q_clean = c["question"].encode("latin-1", "ignore").decode("latin-1")
         topic_clean = c["topic"].encode("latin-1", "ignore").decode("latin-1")
-        pdf.multi_cell(0, 7, f"Q{i}. [{topic_clean}] {q_clean}")
+        pdf.multi_cell(0, 7, f"Q{i}. [{topic_clean}] {q_clean}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 10)
         for k, v in c["options"].items():
             v_clean = v.encode("latin-1", "ignore").decode("latin-1")
-            pdf.multi_cell(0, 6, f"   {k}. {v_clean}")
+            pdf.multi_cell(0, 6, f"   {k}. {v_clean}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "B", 10)
         pdf.set_text_color(0, 128, 0)
-        pdf.multi_cell(0, 6, f"   Correct answer: {c['correct_answer']}")
+        pdf.multi_cell(0, 6, f"   Correct answer: {c['correct_answer']}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
     return bytes(pdf.output())
