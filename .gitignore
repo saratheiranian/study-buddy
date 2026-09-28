@@ -1,5 +1,13 @@
+# Secrets: never commit API keys
 .env
+.streamlit/secrets.toml
+
+# Local database: holds user accounts and study notes
+*.db
+*.db-journal
+
+# Python
 venv/
+.venv/
 __pycache__/
-.env
-.env
+.pytest_cache/
